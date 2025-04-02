@@ -11,6 +11,33 @@ use std::str::FromStr;
 use futures::StreamExt;
 use std::net::Ipv4Addr;
 use std::env;
+use std::process;
+use serde::{Serialize, Deserialize};
+
+const VERSION: &str = "0.1.0";
+
+fn print_usage() {
+    println!("stratum-counter - Monitor TCP connections in Docker containers");
+    println!();
+    println!("Usage: stratum-counter [OPTIONS] [PORT]");
+    println!();
+    println!("Options:");
+    println!("  -h, --help     Show this help message");
+    println!("  -v, --version  Show version information");
+    println!("  -j, --json     Output in JSON format");
+    println!();
+    println!("PORT:");
+    println!("  The port number to monitor (default: 3333)");
+    println!();
+    println!("Examples:");
+    println!("  stratum-counter              # Monitor port 3333");
+    println!("  stratum-counter 34333         # Monitor port 34333");
+    println!("  stratum-counter --json 3333  # Output in JSON format");
+}
+
+fn print_version() {
+    println!("stratum-counter v{}", VERSION);
+}
 
 fn hex_to_ip(hex: &str) -> String {
     if hex.len() != 8 {
@@ -31,7 +58,7 @@ fn hex_to_ip(hex: &str) -> String {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct TcpConnection {
     local_addr: String,
     local_port: u16,
@@ -126,24 +153,52 @@ async fn get_container_tcp_connections(docker: &Docker, container_id: &str) -> R
     Ok(connections)
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ContainerInfo {
+    name: String,
+    id: String,
+    connections: Vec<TcpConnection>,
+}
+
 #[tokio::main]
 async fn main() {
-    // Get port from command line arguments
-    let port = env::args()
-        .nth(1)
-        .and_then(|arg| arg.parse::<u16>().ok())
-        .unwrap_or(3333); // Default to 3333 if no port specified
+    let args: Vec<String> = env::args().collect();
+    let mut port = 3333;
+    let mut json_output = false;
 
-    // Initialize system information
-    let mut sys = System::new_all();
-    sys.refresh_all();
+    // Parse command line arguments
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_usage();
+                process::exit(0);
+            }
+            "-v" | "--version" => {
+                print_version();
+                process::exit(0);
+            }
+            "-j" | "--json" => {
+                json_output = true;
+            }
+            _ => {
+                if let Ok(p) = args[i].parse::<u16>() {
+                    port = p;
+                } else {
+                    eprintln!("Error: Invalid port number '{}'", args[i]);
+                    process::exit(1);
+                }
+            }
+        }
+        i += 1;
+    }
 
     // Connect to Docker daemon
     let docker = match Docker::connect_with_local_defaults() {
         Ok(docker) => docker,
         Err(e) => {
-            eprintln!("Failed to connect to Docker daemon: {}", e);
-            return;
+            eprintln!("Error: Failed to connect to Docker daemon: {}", e);
+            process::exit(1);
         }
     };
 
@@ -154,69 +209,72 @@ async fn main() {
     })).await {
         Ok(containers) => containers,
         Err(e) => {
-            eprintln!("Failed to list Docker containers: {}", e);
-            return;
+            eprintln!("Error: Failed to list Docker containers: {}", e);
+            process::exit(1);
         }
     };
 
-    // Create a map of container IDs to container names
-    let container_map: HashMap<String, String> = containers
-        .iter()
-        .filter_map(|c| {
-            c.id.as_ref().map(|id| {
-                let name = c.names.as_ref()
-                    .and_then(|n| n.first())
-                    .map(|n| n.trim_start_matches('/').to_string())
-                    .unwrap_or_else(|| id.clone());
-                (id.clone(), name)
-            })
-        })
-        .collect();
-
-    println!("\nEstablished TCP Connections from Port {} in Docker Containers:", port);
-    println!("{:-<80}", "");
-
+    let mut container_infos = Vec::new();
     let mut total_connections = 0;
 
-    // Check each container's TCP connections
+    // Process each container
     for container in containers {
         if let Some(container_id) = container.id {
             match get_container_tcp_connections(&docker, &container_id).await {
                 Ok(connections) => {
-                    // Filter for established connections (state 1) from specified port
                     let container_connections: Vec<_> = connections
                         .into_iter()
-                        .filter(|conn| {
-                            conn.state == 1 && // ESTABLISHED state
-                            conn.local_port == port
-                        })
+                        .filter(|conn| conn.state == 1 && conn.local_port == port)
                         .collect();
 
                     if !container_connections.is_empty() {
-                        let container_name = container_map.get(&container_id).unwrap_or(&container_id);
-                        println!("Container: {} (ID: {})", container_name, container_id);
-                        println!("Number of connections: {}", container_connections.len());
-                        println!("{:-<80}", "");
+                        let container_name = container.names.as_ref()
+                            .and_then(|n| n.first())
+                            .map(|n| n.trim_start_matches('/').to_string())
+                            .unwrap_or_else(|| container_id.clone());
 
-                        for conn in container_connections {
-                            println!("Local Address:   {}:{}", conn.local_addr, conn.local_port);
-                            println!("Remote Address:  {}:{}", conn.remote_addr, conn.remote_port);
-                            println!("State:          ESTABLISHED");
-                            println!("{:-<80}", "");
-                            total_connections += 1;
-                        }
+                        container_infos.push(ContainerInfo {
+                            name: container_name,
+                            id: container_id,
+                            connections: container_connections.clone(),
+                        });
+
+                        total_connections += container_connections.len();
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to get TCP connections for container {}: {}", container_id, e);
+                    eprintln!("Warning: Failed to get TCP connections for container {}: {}", container_id, e);
                 }
             }
         }
     }
 
-    if total_connections == 0 {
-        println!("No established TCP connections found from port {} in Docker containers.", port);
+    // Output results
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&container_infos).unwrap_or_else(|_| "[]".to_string()));
     } else {
-        println!("Total connections found: {}", total_connections);
+        println!("Established TCP Connections from Port {} in Docker Containers:", port);
+        println!("{:-<80}", "");
+
+        for info in container_infos {
+            println!("Container: {} (ID: {})", info.name, info.id);
+            println!("Number of connections: {}", info.connections.len());
+            println!("{:-<80}", "");
+
+            for conn in info.connections {
+                println!("Local Address:   {}:{}", conn.local_addr, conn.local_port);
+                println!("Remote Address:  {}:{}", conn.remote_addr, conn.remote_port);
+                println!("State:          ESTABLISHED");
+                println!("{:-<80}", "");
+            }
+        }
+
+        if total_connections == 0 {
+            println!("No established TCP connections found from port {} in Docker containers.", port);
+        } else {
+            println!("Total connections found: {}", total_connections);
+        }
     }
+
+    process::exit(0);
 }

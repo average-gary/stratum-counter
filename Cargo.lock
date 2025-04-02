@@ -1227,6 +1227,8 @@ dependencies = [
  "bollard",
  "futures",
  "netstat2",
+ "serde",
+ "serde_json",
  "sysinfo",
  "tokio",
 ]
