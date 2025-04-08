@@ -7,8 +7,13 @@ use opentelemetry::{
     global,
     trace::{Span, Tracer, TracerProvider},
     KeyValue,
+    metrics::{Counter, Meter},
 };
-use opentelemetry_datadog::{new_pipeline, ApiVersion};
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{
+    trace::{self, RandomIdGenerator, Sampler, SdkTracer},
+    Resource,
+};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error as StdError;
@@ -16,6 +21,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::process;
 use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(Debug)]
 struct StringError(String);
@@ -29,6 +35,10 @@ impl fmt::Display for StringError {
 impl StdError for StringError {}
 
 const VERSION: &str = "0.1.0";
+
+// Add build information constants
+const SRC_HASH: &str = env!("SRC_HASH", "unknown");
+const BUILD_DATE: &str = env!("BUILD_DATE", "unknown");
 
 fn print_usage() {
     println!("stratum-counter - Monitor TCP connections in Docker containers");
@@ -54,6 +64,8 @@ fn print_version() {
 }
 
 fn hex_to_ip(hex: &str) -> String {
+    // The IP address is stored in network byte order (big-endian)
+    // Each byte is represented by 2 hex characters
     if hex.len() != 8 {
         return hex.to_string();
     }
@@ -66,7 +78,8 @@ fn hex_to_ip(hex: &str) -> String {
     }
 
     if bytes.len() == 4 {
-        Ipv4Addr::new(bytes[3], bytes[2], bytes[1], bytes[0]).to_string()
+        // Convert from network byte order to host byte order
+        Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string()
     } else {
         hex.to_string()
     }
@@ -81,37 +94,66 @@ struct TcpConnection {
     state: u8,
 }
 
+impl TcpConnection {
+    fn get_state_name(&self) -> &'static str {
+        match self.state {
+            1 => "ESTABLISHED",
+            2 => "SYN_SENT",
+            3 => "SYN_RECV",
+            4 => "FIN_WAIT1",
+            5 => "FIN_WAIT2",
+            6 => "TIME_WAIT",
+            7 => "CLOSE",
+            8 => "CLOSE_WAIT",
+            9 => "LAST_ACK",
+            10 => "LISTEN",
+            11 => "CLOSING",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
 impl FromStr for TcpConnection {
     type Err = String;
 
     fn from_str(line: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 4 {
-            return Err("Invalid line format".to_string());
+        // Skip empty lines and header line
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("sl") {
+            return Err("SKIP".to_string());  // Special value to indicate intentional skip
         }
 
-        // Parse local address and port
-        let local = parts[1];
+        // Split the line into parts and ensure we have enough fields
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() < 4 {
+            return Err(format!("Invalid line format: expected at least 4 fields, got {}", parts.len()));
+        }
+
+        // Extract the relevant fields (skip the first field which is the line number)
+        let local = parts[1];  // local_address:port in hex
+        let remote = parts[2]; // remote_address:port in hex
+        let state = parts[3];  // connection state in hex
+
+        // Parse local address and port (format: 00000000:0000)
         let local_parts: Vec<&str> = local.split(':').collect();
         if local_parts.len() != 2 {
-            return Err("Invalid local address format".to_string());
+            return Err(format!("Invalid local address format: {}", local));
         }
         let local_addr = hex_to_ip(local_parts[0]);
         let local_port = u16::from_str_radix(local_parts[1], 16)
             .map_err(|e| format!("Failed to parse local port: {}", e))?;
 
-        // Parse remote address and port
-        let remote = parts[2];
+        // Parse remote address and port (format: 00000000:0000)
         let remote_parts: Vec<&str> = remote.split(':').collect();
         if remote_parts.len() != 2 {
-            return Err("Invalid remote address format".to_string());
+            return Err(format!("Invalid remote address format: {}", remote));
         }
         let remote_addr = hex_to_ip(remote_parts[0]);
         let remote_port = u16::from_str_radix(remote_parts[1], 16)
             .map_err(|e| format!("Failed to parse remote port: {}", e))?;
 
-        // Parse state
-        let state = u8::from_str_radix(parts[3], 16)
+        // Parse state (format: 0A)
+        let state = u8::from_str_radix(state, 16)
             .map_err(|e| format!("Failed to parse state: {}", e))?;
 
         Ok(TcpConnection {
@@ -150,19 +192,20 @@ async fn get_container_tcp_connections(
     let mut connections = Vec::new();
     match start_exec {
         StartExecResults::Attached { mut output, .. } => {
-            while let Some(Ok(output)) = output.next().await {
-                match output {
-                    LogOutput::StdOut { message } | LogOutput::StdErr { message } => {
-                        let line = String::from_utf8_lossy(&message);
-                        // Skip header line
-                        if line.starts_with("sl") {
-                            continue;
-                        }
-                        if let Ok(conn) = TcpConnection::from_str(&line) {
-                            connections.push(conn);
+            while let Some(result) = output.next().await {
+                match result {
+                    Ok(LogOutput::StdOut { message }) | Ok(LogOutput::StdErr { message }) => {
+                        let content = String::from_utf8_lossy(&message);
+                        for line in content.lines() {
+                            match TcpConnection::from_str(line) {
+                                Ok(conn) => connections.push(conn),
+                                Err(e) if e == "SKIP" => continue,
+                                Err(e) => eprintln!("Error parsing TCP connection: {}", e),
+                            }
                         }
                     }
-                    _ => continue,
+                    Ok(_) => continue,
+                    Err(e) => eprintln!("Error reading from container: {}", e),
                 }
             }
         }
@@ -209,33 +252,70 @@ fn get_env() -> Env {
     }
 }
 
-fn init_tracer() -> opentelemetry_sdk::trace::Tracer {
-    // Check for required Datadog API key
-    if env::var("DD_API_KEY").is_err() {
-        eprintln!("Error: DD_API_KEY environment variable is required for Datadog tracing");
-        eprintln!("Please set your Datadog API key: export DD_API_KEY=your_api_key");
-        process::exit(1);
-    }
+struct Components {
+    tracer: opentelemetry_sdk::trace::Tracer,
+    meter: Meter,
+    provider: opentelemetry_sdk::trace::SdkTracerProvider,
+}
 
-    let provider = new_pipeline()
-        .with_env(get_env())
-        .with_version(VERSION)
-        .with_service_name("stratum-counter")
-        .with_api_version(ApiVersion::Version05)
-        .install_batch().expect("Failed to init provider");
-    let tracer = provider.tracer("stratum-counter");
-    global::set_tracer_provider(provider);
-    tracer
+fn init_tracer() -> Components {
+    // Create a new OTLP exporter
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint("http://localhost:4318")
+        .build()
+        .expect("Failed to create OTLP exporter");
+
+    // Create a tracer provider with the exporter
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_sampler(Sampler::AlwaysOn)
+        .with_id_generator(RandomIdGenerator::default())
+        .with_resource(Resource::builder_empty()
+            .with_attributes([
+                KeyValue::new("service.name", "stratum-counter"),
+                KeyValue::new("service.version", VERSION),
+            ])
+            .build())
+        .build();
+
+    // Set the global tracer provider
+    global::set_tracer_provider(tracer_provider.clone());
+
+    // Get a tracer
+    let tracer = tracer_provider.tracer("stratum-counter");
+
+    // Get a meter from the global provider
+    let meter = global::meter("stratum-counter");
+
+    Components {
+        tracer,
+        meter,
+        provider: tracer_provider,
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let tracer = init_tracer();
-    let mut span = tracer.start("stratum_counter_run");
+    let components = init_tracer();
+    let mut span = components.tracer.start("stratum_counter_run");
     span.set_attribute(KeyValue::new("version", VERSION));
 
+    // Create metrics
+    let tcp_connections = components.meter
+        .u64_counter("tcp.connections")
+        .with_description("Number of TCP connections")
+        .build();
+
+    let tcp_connections_by_state = components.meter
+        .u64_counter("tcp.connections.by_state")
+        .with_description("Number of TCP connections by state")
+        .build();
+
+    println!("stratum-counter v{} (src: {}, built: {})", VERSION, SRC_HASH, BUILD_DATE);
+    println!("{:-<80}", "");
+
     let args: Vec<String> = env::args().collect();
-    let mut port = 3333;
     let mut json_output = false;
 
     // Parse command line arguments
@@ -254,18 +334,13 @@ async fn main() {
                 json_output = true;
             }
             _ => {
-                if let Ok(p) = args[i].parse::<u16>() {
-                    port = p;
-                } else {
-                    eprintln!("Error: Invalid port number '{}'", args[i]);
-                    process::exit(1);
-                }
+                eprintln!("Error: Unknown argument '{}'", args[i]);
+                process::exit(1);
             }
         }
         i += 1;
     }
 
-    span.set_attribute(KeyValue::new("port", port as i64));
     span.set_attribute(KeyValue::new("json_output", json_output));
 
     // Connect to Docker daemon
@@ -300,17 +375,12 @@ async fn main() {
     // Process each container
     for container in containers {
         if let Some(container_id) = container.id {
-            let mut container_span = tracer.start("process_container");
+            let mut container_span = components.tracer.start("process_container");
             container_span.set_attribute(KeyValue::new("container.id", container_id.clone()));
 
             match get_container_tcp_connections(&docker, &container_id).await {
                 Ok(connections) => {
-                    let container_connections: Vec<_> = connections
-                        .into_iter()
-                        .filter(|conn| conn.state == 1 && conn.local_port == port)
-                        .collect();
-
-                    if !container_connections.is_empty() {
+                    if !connections.is_empty() {
                         let container_name = container
                             .names
                             .as_ref()
@@ -322,16 +392,38 @@ async fn main() {
                             .set_attribute(KeyValue::new("container.name", container_name.clone()));
                         container_span.set_attribute(KeyValue::new(
                             "connection.count",
-                            container_connections.len() as i64,
+                            connections.len() as i64,
                         ));
+
+                        // Record metrics for total connections
+                        tcp_connections.add(
+                            connections.len() as u64,
+                            &[
+                                KeyValue::new("container.name", container_name.clone()),
+                                KeyValue::new("container.id", container_id.clone()),
+                            ],
+                        );
+
+                        // Record metrics for connections by state
+                        for conn in &connections {
+                            tcp_connections_by_state.add(
+                                1,
+                                &[
+                                    KeyValue::new("container.name", container_name.clone()),
+                                    KeyValue::new("container.id", container_id.clone()),
+                                    KeyValue::new("state", conn.get_state_name().to_string()),
+                                    KeyValue::new("local_port", conn.local_port.to_string()),
+                                ],
+                            );
+                        }
 
                         container_infos.push(ContainerInfo {
                             name: container_name,
                             id: container_id,
-                            connections: container_connections.clone(),
+                            connections: connections.clone(),
                         });
 
-                        total_connections += container_connections.len();
+                        total_connections += connections.len();
                     }
                     container_span.end();
                 }
@@ -358,10 +450,7 @@ async fn main() {
             serde_json::to_string_pretty(&container_infos).unwrap_or_else(|_| "[]".to_string())
         );
     } else {
-        println!(
-            "Established TCP Connections from Port {} in Docker Containers:",
-            port
-        );
+        println!("TCP Connections in Docker Containers:");
         println!("{:-<80}", "");
 
         for info in container_infos {
@@ -372,21 +461,21 @@ async fn main() {
             for conn in info.connections {
                 println!("Local Address:   {}:{}", conn.local_addr, conn.local_port);
                 println!("Remote Address:  {}:{}", conn.remote_addr, conn.remote_port);
-                println!("State:          ESTABLISHED");
+                println!("State:          {}", conn.get_state_name());
                 println!("{:-<80}", "");
             }
         }
 
-        if total_connections == 0 {
-            println!(
-                "No established TCP connections found from port {} in Docker containers.",
-                port
-            );
-        } else {
-            println!("Total connections found: {}", total_connections);
-        }
+        println!("Total connections found: {}", total_connections);
     }
 
+    // Add a small delay to ensure metrics are exported
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
     span.end();
+
+    // Shutdown the provider
+    let _ = components.provider.shutdown();
+    println!("Shutdown OpenTelemetry provider");
     process::exit(0);
 }
