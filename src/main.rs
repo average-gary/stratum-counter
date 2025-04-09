@@ -3,6 +3,7 @@ use bollard::{
     exec::StartExecResults, Docker,
 };
 use futures::StreamExt;
+use log::{debug, error, info, warn};
 use opentelemetry::{
     global,
     metrics::{Counter, Meter, MeterProvider},
@@ -24,17 +25,29 @@ use std::str::FromStr;
 use std::time::Duration;
 use tokio::signal;
 use tokio::time::sleep;
+use gethostname;
+use env_logger;
 
 #[derive(Debug)]
-struct StringError(String);
+enum StratumError {
+    DockerError(String),
+    ParseError(String),
+    MetricsError(String),
+    InvalidInput(String),
+}
 
-impl fmt::Display for StringError {
+impl fmt::Display for StratumError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        match self {
+            StratumError::DockerError(e) => write!(f, "Docker error: {}", e),
+            StratumError::ParseError(e) => write!(f, "Parse error: {}", e),
+            StratumError::MetricsError(e) => write!(f, "Metrics error: {}", e),
+            StratumError::InvalidInput(e) => write!(f, "Invalid input: {}", e),
+        }
     }
 }
 
-impl StdError for StringError {}
+impl StdError for StratumError {}
 
 const VERSION: &str = "0.1.0";
 
@@ -172,7 +185,8 @@ async fn get_container_tcp_connections(
     docker: &Docker,
     container_id: &str,
 ) -> Result<Vec<TcpConnection>, String> {
-    // Create exec command to read /proc/net/tcp
+    debug!("Getting TCP connections for container {}", container_id);
+    
     let exec_options = CreateExecOptions {
         attach_stdout: Some(true),
         attach_stderr: Some(true),
@@ -202,28 +216,30 @@ async fn get_container_tcp_connections(
                             match TcpConnection::from_str(line) {
                                 Ok(conn) => {
                                     connections.push(conn.clone());
-                                    println!("Connection: {:?}", conn);
+                                    debug!("Found connection: {:?}", conn);
                                 },
                                 Err(e) if e == "SKIP" => continue,
-                                Err(e) => eprintln!("Error parsing TCP connection: {}", e),
+                                Err(e) => warn!("Error parsing TCP connection: {}", e),
                             }
                         }
                     }
                     Ok(_) => continue,
-                    Err(e) => eprintln!("Error reading from container: {}", e),
+                    Err(e) => error!("Error reading from container: {}", e),
                 }
             }
         }
         _ => return Err("Failed to get exec output".to_string()),
     }
 
+    info!("Found {} TCP connections for container {}", connections.len(), container_id);
     Ok(connections)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct ContainerInfo {
+struct ContainerMetrics {
     name: String,
     id: String,
+    host: String,
     connections: Vec<TcpConnection>,
 }
 
@@ -232,7 +248,6 @@ async fn collect_metrics(
     tcp_connections: &Counter<u64>,
     tcp_connections_by_state: &Counter<u64>,
 ) -> Result<(), Box<dyn StdError + Send + Sync>> {
-    // Get list of containers
     let containers = docker
         .list_containers(Some(ListContainersOptions::<String> {
             all: true,
@@ -252,24 +267,32 @@ async fn collect_metrics(
                             .map(|n| n.trim_start_matches('/').to_string())
                             .unwrap_or_else(|| container_id.clone());
 
-                        // Record metrics for total connections
+                        // Get host information
+                        let host = gethostname::gethostname()
+                            .into_string()
+                            .unwrap_or_else(|_| "unknown".to_string());
+
+                        // Record total connections
                         tcp_connections.add(
                             connections.len() as u64,
                             &[
                                 KeyValue::new("container.name", container_name.clone()),
                                 KeyValue::new("container.id", container_id.clone()),
+                                KeyValue::new("host", host.clone()),
                             ],
                         );
 
-                        // Record metrics for connections by state
+                        // Record connections by state
                         for conn in &connections {
                             tcp_connections_by_state.add(
                                 1,
                                 &[
                                     KeyValue::new("container.name", container_name.clone()),
                                     KeyValue::new("container.id", container_id.clone()),
+                                    KeyValue::new("host", host.clone()),
                                     KeyValue::new("state", conn.get_state_name().to_string()),
                                     KeyValue::new("local_port", conn.local_port.to_string()),
+                                    KeyValue::new("remote_addr", conn.remote_addr.clone()),
                                 ],
                             );
                         }
@@ -290,15 +313,22 @@ async fn collect_metrics(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError + Send + Sync>> {
+    // Initialize logging
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp(None)
+        .init();
+    
+    info!("Starting stratum-counter v{} (src: {}, built: {})", VERSION, SRC_HASH, BUILD_DATE);
     
     // Initialize metrics
     let meter_exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_tonic()
         .with_endpoint("http://localhost:4317")
-        .build()?;
+        .build()
+        .map_err(|e| StratumError::MetricsError(e.to_string()))?;
     
     let reader = PeriodicReader::builder(meter_exporter)
-        .with_interval(Duration::from_secs(2)) // Export every minute
+        .with_interval(Duration::from_secs(300))
         .build();
     
     let provider = SdkMeterProvider::builder()
@@ -320,36 +350,33 @@ async fn main() -> Result<(), Box<dyn StdError + Send + Sync>> {
         .build();
 
     // Connect to Docker daemon
-    let docker = Docker::connect_with_local_defaults()?;
+    let docker = Docker::connect_with_local_defaults()
+        .map_err(|e| StratumError::DockerError(e.to_string()))?;
 
-    println!("stratum-counter v{} (src: {}, built: {})", VERSION, SRC_HASH, BUILD_DATE);
-    println!("Starting daemon mode - checking containers every 5 minutes");
-    println!("Press Ctrl+C to exit");
+    info!("Starting daemon mode - checking containers every 5 minutes");
+    info!("Press Ctrl+C to exit");
 
     // Main loop
     loop {
         // Collect metrics
         if let Err(e) = collect_metrics(&docker, &tcp_connections, &tcp_connections_by_state).await {
-            eprintln!("Error collecting metrics: {}", e);
+            error!("Error collecting metrics: {}", e);
         }
-        println!("Metrics collected");
+        info!("Metrics collected successfully");
 
         // Wait for next iteration or shutdown signal
         tokio::select! {
-            _ = sleep(Duration::from_secs(300)) => {
+            _ = sleep(Duration::from_secs(30)) => {
                 // 5 minutes have passed, continue to next iteration
             }
             _ = signal::ctrl_c() => {
-                println!("\nShutting down...");
+                info!("Shutting down...");
                 break;
             }
         }
     }
 
-    println!("Shutting down...");
-
-
-
+    info!("Shutdown complete");
     sleep(Duration::from_secs(1)).await; // Give time for final export
 
     Ok(())
