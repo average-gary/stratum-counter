@@ -328,7 +328,7 @@ async fn main() -> Result<(), Box<dyn StdError + Send + Sync>> {
         .map_err(|e| StratumError::MetricsError(e.to_string()))?;
     
     let reader = PeriodicReader::builder(meter_exporter)
-        .with_interval(Duration::from_secs(300))
+        .with_interval(Duration::from_secs(60))
         .build();
     
     let provider = SdkMeterProvider::builder()
@@ -366,7 +366,7 @@ async fn main() -> Result<(), Box<dyn StdError + Send + Sync>> {
 
         // Wait for next iteration or shutdown signal
         tokio::select! {
-            _ = sleep(Duration::from_secs(30)) => {
+            _ = sleep(Duration::from_secs(300)) => {
                 // 5 minutes have passed, continue to next iteration
             }
             _ = signal::ctrl_c() => {
