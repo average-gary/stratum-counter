@@ -6,7 +6,7 @@ use futures::StreamExt;
 use log::{debug, error, info, warn};
 use opentelemetry::{
     global,
-    metrics::{Counter, Meter, MeterProvider},
+    metrics::{Gauge, Meter, MeterProvider},
     trace::FutureExt,
     KeyValue,
 };
@@ -245,8 +245,8 @@ struct ContainerMetrics {
 
 async fn collect_metrics(
     docker: &Docker,
-    tcp_connections: &Counter<u64>,
-    tcp_connections_by_state: &Counter<u64>,
+    tcp_connections: &Gauge<u64>,
+    tcp_connections_by_state: &Gauge<u64>,
 ) -> Result<(), Box<dyn StdError + Send + Sync>> {
     let containers = docker
         .list_containers(Some(ListContainersOptions::<String> {
@@ -273,7 +273,7 @@ async fn collect_metrics(
                             .unwrap_or_else(|_| "unknown".to_string());
 
                         // Record total connections
-                        tcp_connections.add(
+                        tcp_connections.record(
                             connections.len() as u64,
                             &[
                                 KeyValue::new("container.name", container_name.clone()),
@@ -284,7 +284,7 @@ async fn collect_metrics(
 
                         // Record connections by state
                         for conn in &connections {
-                            tcp_connections_by_state.add(
+                            tcp_connections_by_state.record(
                                 1,
                                 &[
                                     KeyValue::new("container.name", container_name.clone()),
@@ -299,8 +299,8 @@ async fn collect_metrics(
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to get TCP connections for container {}: {}",
+                    warn!(
+                        "Failed to get TCP connections for container {}: {}",
                         container_id, e
                     );
                 }
@@ -340,13 +340,13 @@ async fn main() -> Result<(), Box<dyn StdError + Send + Sync>> {
     // Create metrics
     let meter = global::meter("stratum-counter");
     let tcp_connections = meter
-        .u64_counter("tcp.connections")
-        .with_description("Number of TCP connections")
+        .u64_gauge("tcp.connections")
+        .with_description("Current number of TCP connections")
         .build();
 
     let tcp_connections_by_state = meter
-        .u64_counter("tcp.connections.by_state")
-        .with_description("Number of TCP connections by state")
+        .u64_gauge("tcp.connections.by_state")
+        .with_description("Current number of TCP connections by state")
         .build();
 
     // Connect to Docker daemon
