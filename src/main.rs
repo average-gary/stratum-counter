@@ -5,14 +5,14 @@ use bollard::{
 use futures::StreamExt;
 use opentelemetry::{
     global,
-    trace::{Span, Tracer, TracerProvider},
+    metrics::{Counter, Meter, MeterProvider},
+    trace::FutureExt,
     KeyValue,
-    metrics::{Counter, Meter},
 };
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::{
-    trace::{self, RandomIdGenerator, Sampler, SdkTracer},
-    Resource,
+    metrics::{PeriodicReader, SdkMeterProvider},
+    runtime::Tokio,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -22,6 +22,8 @@ use std::net::Ipv4Addr;
 use std::process;
 use std::str::FromStr;
 use std::time::Duration;
+use tokio::signal;
+use tokio::time::sleep;
 
 #[derive(Debug)]
 struct StringError(String);
@@ -198,7 +200,10 @@ async fn get_container_tcp_connections(
                         let content = String::from_utf8_lossy(&message);
                         for line in content.lines() {
                             match TcpConnection::from_str(line) {
-                                Ok(conn) => connections.push(conn),
+                                Ok(conn) => {
+                                    connections.push(conn.clone());
+                                    println!("Connection: {:?}", conn);
+                                },
                                 Err(e) if e == "SKIP" => continue,
                                 Err(e) => eprintln!("Error parsing TCP connection: {}", e),
                             }
@@ -222,162 +227,21 @@ struct ContainerInfo {
     connections: Vec<TcpConnection>,
 }
 
-enum Env {
-    Dev,
-    Prod,
-    Staging,
-}
-
-impl fmt::Display for Env {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Env::Dev => write!(f, "dev"),
-            Env::Prod => write!(f, "prod"),
-            Env::Staging => write!(f, "staging"),
-        }
-    }
-}
-
-impl Into<String> for Env {
-    fn into(self) -> String {
-        self.to_string()
-    }
-}
-
-fn get_env() -> Env {
-    match env::var("ENV").unwrap_or_else(|_| "dev".to_string()).as_str() {
-        "prod" => Env::Prod,
-        "staging" => Env::Staging,
-        _ => Env::Dev,
-    }
-}
-
-struct Components {
-    tracer: opentelemetry_sdk::trace::Tracer,
-    meter: Meter,
-    provider: opentelemetry_sdk::trace::SdkTracerProvider,
-}
-
-fn init_tracer() -> Components {
-    // Create a new OTLP exporter
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_endpoint("http://localhost:4318")
-        .build()
-        .expect("Failed to create OTLP exporter");
-
-    // Create a tracer provider with the exporter
-    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_sampler(Sampler::AlwaysOn)
-        .with_id_generator(RandomIdGenerator::default())
-        .with_resource(Resource::builder_empty()
-            .with_attributes([
-                KeyValue::new("service.name", "stratum-counter"),
-                KeyValue::new("service.version", VERSION),
-            ])
-            .build())
-        .build();
-
-    // Set the global tracer provider
-    global::set_tracer_provider(tracer_provider.clone());
-
-    // Get a tracer
-    let tracer = tracer_provider.tracer("stratum-counter");
-
-    // Get a meter from the global provider
-    let meter = global::meter("stratum-counter");
-
-    Components {
-        tracer,
-        meter,
-        provider: tracer_provider,
-    }
-}
-
-#[tokio::main]
-async fn main() {
-    let components = init_tracer();
-    let mut span = components.tracer.start("stratum_counter_run");
-    span.set_attribute(KeyValue::new("version", VERSION));
-
-    // Create metrics
-    let tcp_connections = components.meter
-        .u64_counter("tcp.connections")
-        .with_description("Number of TCP connections")
-        .build();
-
-    let tcp_connections_by_state = components.meter
-        .u64_counter("tcp.connections.by_state")
-        .with_description("Number of TCP connections by state")
-        .build();
-
-    println!("stratum-counter v{} (src: {}, built: {})", VERSION, SRC_HASH, BUILD_DATE);
-    println!("{:-<80}", "");
-
-    let args: Vec<String> = env::args().collect();
-    let mut json_output = false;
-
-    // Parse command line arguments
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-h" | "--help" => {
-                print_usage();
-                process::exit(0);
-            }
-            "-v" | "--version" => {
-                print_version();
-                process::exit(0);
-            }
-            "-j" | "--json" => {
-                json_output = true;
-            }
-            _ => {
-                eprintln!("Error: Unknown argument '{}'", args[i]);
-                process::exit(1);
-            }
-        }
-        i += 1;
-    }
-
-    span.set_attribute(KeyValue::new("json_output", json_output));
-
-    // Connect to Docker daemon
-    let docker = match Docker::connect_with_local_defaults() {
-        Ok(docker) => docker,
-        Err(e) => {
-            span.record_error(&e as &dyn StdError);
-            eprintln!("Error: Failed to connect to Docker daemon: {}", e);
-            process::exit(1);
-        }
-    };
-
+async fn collect_metrics(
+    docker: &Docker,
+    tcp_connections: &Counter<u64>,
+    tcp_connections_by_state: &Counter<u64>,
+) -> Result<(), Box<dyn StdError + Send + Sync>> {
     // Get list of containers
-    let containers = match docker
+    let containers = docker
         .list_containers(Some(ListContainersOptions::<String> {
             all: true,
             ..Default::default()
         }))
-        .await
-    {
-        Ok(containers) => containers,
-        Err(e) => {
-            span.record_error(&e as &dyn StdError);
-            eprintln!("Error: Failed to list Docker containers: {}", e);
-            process::exit(1);
-        }
-    };
+        .await?;
 
-    let mut container_infos = Vec::new();
-    let mut total_connections = 0;
-
-    // Process each container
     for container in containers {
         if let Some(container_id) = container.id {
-            let mut container_span = components.tracer.start("process_container");
-            container_span.set_attribute(KeyValue::new("container.id", container_id.clone()));
-
             match get_container_tcp_connections(&docker, &container_id).await {
                 Ok(connections) => {
                     if !connections.is_empty() {
@@ -387,13 +251,6 @@ async fn main() {
                             .and_then(|n| n.first())
                             .map(|n| n.trim_start_matches('/').to_string())
                             .unwrap_or_else(|| container_id.clone());
-
-                        container_span
-                            .set_attribute(KeyValue::new("container.name", container_name.clone()));
-                        container_span.set_attribute(KeyValue::new(
-                            "connection.count",
-                            connections.len() as i64,
-                        ));
 
                         // Record metrics for total connections
                         tcp_connections.add(
@@ -416,66 +273,84 @@ async fn main() {
                                 ],
                             );
                         }
-
-                        container_infos.push(ContainerInfo {
-                            name: container_name,
-                            id: container_id,
-                            connections: connections.clone(),
-                        });
-
-                        total_connections += connections.len();
                     }
-                    container_span.end();
                 }
                 Err(e) => {
-                    let error_msg = e.clone();
-                    let error = StringError(e);
-                    container_span.record_error(&error as &dyn StdError);
                     eprintln!(
                         "Warning: Failed to get TCP connections for container {}: {}",
-                        container_id, error_msg
+                        container_id, e
                     );
-                    container_span.end();
                 }
             }
         }
     }
 
-    span.set_attribute(KeyValue::new("total_connections", total_connections as i64));
+    Ok(())
+}
 
-    // Output results
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&container_infos).unwrap_or_else(|_| "[]".to_string())
-        );
-    } else {
-        println!("TCP Connections in Docker Containers:");
-        println!("{:-<80}", "");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn StdError + Send + Sync>> {
+    
+    // Initialize metrics
+    let meter_exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint("http://localhost:4317")
+        .build()?;
+    
+    let reader = PeriodicReader::builder(meter_exporter)
+        .with_interval(Duration::from_secs(2)) // Export every minute
+        .build();
+    
+    let provider = SdkMeterProvider::builder()
+        .with_reader(reader)
+        .build();
+    
+    global::set_meter_provider(provider);
 
-        for info in container_infos {
-            println!("Container: {} (ID: {})", info.name, info.id);
-            println!("Number of connections: {}", info.connections.len());
-            println!("{:-<80}", "");
+    // Create metrics
+    let meter = global::meter("stratum-counter");
+    let tcp_connections = meter
+        .u64_counter("tcp.connections")
+        .with_description("Number of TCP connections")
+        .build();
 
-            for conn in info.connections {
-                println!("Local Address:   {}:{}", conn.local_addr, conn.local_port);
-                println!("Remote Address:  {}:{}", conn.remote_addr, conn.remote_port);
-                println!("State:          {}", conn.get_state_name());
-                println!("{:-<80}", "");
+    let tcp_connections_by_state = meter
+        .u64_counter("tcp.connections.by_state")
+        .with_description("Number of TCP connections by state")
+        .build();
+
+    // Connect to Docker daemon
+    let docker = Docker::connect_with_local_defaults()?;
+
+    println!("stratum-counter v{} (src: {}, built: {})", VERSION, SRC_HASH, BUILD_DATE);
+    println!("Starting daemon mode - checking containers every 5 minutes");
+    println!("Press Ctrl+C to exit");
+
+    // Main loop
+    loop {
+        // Collect metrics
+        if let Err(e) = collect_metrics(&docker, &tcp_connections, &tcp_connections_by_state).await {
+            eprintln!("Error collecting metrics: {}", e);
+        }
+        println!("Metrics collected");
+
+        // Wait for next iteration or shutdown signal
+        tokio::select! {
+            _ = sleep(Duration::from_secs(300)) => {
+                // 5 minutes have passed, continue to next iteration
+            }
+            _ = signal::ctrl_c() => {
+                println!("\nShutting down...");
+                break;
             }
         }
-
-        println!("Total connections found: {}", total_connections);
     }
 
-    // Add a small delay to ensure metrics are exported
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    println!("Shutting down...");
 
-    span.end();
 
-    // Shutdown the provider
-    let _ = components.provider.shutdown();
-    println!("Shutdown OpenTelemetry provider");
-    process::exit(0);
+
+    sleep(Duration::from_secs(1)).await; // Give time for final export
+
+    Ok(())
 }
