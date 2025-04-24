@@ -315,7 +315,7 @@ async fn collect_metrics(
 async fn main() -> Result<(), Box<dyn StdError + Send + Sync>> {
     // Initialize logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp(None)
+        .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
         .init();
     
     info!("Starting stratum-counter v{} (src: {}, built: {})", VERSION, SRC_HASH, BUILD_DATE);
